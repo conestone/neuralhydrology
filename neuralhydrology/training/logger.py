@@ -45,6 +45,8 @@ class Logger(object):
         self._metrics = defaultdict(list)
         self.writer = None
 
+        self.cfg = cfg
+
     @property
     def tag(self):
         return "train" if self._train else "valid"
@@ -123,6 +125,47 @@ class Logger(object):
             tag = self.tag
             for k, v in kwargs.items():
                 self.writer.add_scalar('/'.join([tag, k]), v, self.update)
+
+    def log_model(self, weight_path, optimizer_path):
+        """Log model and optimizer checkpoints.
+
+        Parameters
+        ----------
+        weight_path : str or Path
+            Path to the model weights file.
+        optimizer_path : str or Path
+            Path to the optimizer state file.
+        """
+        # For tensorboard, we just log that the model was saved at this step
+        if self.writer is not None:
+            self.writer.add_text(f"model/saved", f"Model saved at epoch {self.epoch}, step {self.update}", self.update)
+            if optimizer_path is not None:
+                self.writer.add_text(f"optimizer/saved", f"Optimizer saved at epoch {self.epoch}, step {self.update}", self.update)
+
+    def log_best_model(self, weight_path, epoch):
+        """Log the best model checkpoint.
+
+        Parameters
+        ----------
+        weight_path : str or Path
+            Path to the best model weights file.
+        epoch : int
+            Epoch number when this best model was saved.
+        """
+        # For tensorboard, we log that the best model was saved
+        if self.writer is not None:
+            self.writer.add_text(f"best_model/saved", f"Best model saved at epoch {epoch}", self.update)
+
+    def log_lr(self, learning_rate: float):
+        """Log current learning rate.
+
+        Parameters
+        ----------
+        learning_rate : float
+            Current learning rate value.
+        """
+        if self.writer is not None:
+            self.writer.add_scalar("train/learning_rate", learning_rate, self.update)
 
     def summarise(self) -> Union[float, Dict[str, float]]:
         """"Log the results of the entire training or validation epoch.

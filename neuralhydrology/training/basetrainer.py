@@ -4,7 +4,7 @@ import random
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -18,11 +18,11 @@ from neuralhydrology.datautils.utils import load_basin_file, load_scaler
 from neuralhydrology.evaluation import get_tester
 from neuralhydrology.evaluation.tester import BaseTester
 from neuralhydrology.modelzoo import get_model
-from neuralhydrology.training import get_loss_obj, get_optimizer, get_regularization_obj
+from neuralhydrology.training import get_loss_obj, get_optimizer, get_regularization_obj, get_lr_scheduler
+from neuralhydrology.training.early_stopping import EarlyStopping
 from neuralhydrology.training.logger import Logger
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.logging_utils import setup_logging
-from neuralhydrology.training.earlystopper import EarlyStopper
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,10 +41,12 @@ class BaseTrainer(object):
         self.cfg = cfg
         self.model = None
         self.optimizer = None
+        self.lr_scheduler = None
         self.loss_obj = None
         self.experiment_logger = None
         self.loader = None
         self.validator = None
+        self.early_stopping = None
         self.noise_sampler_y = None
         self._target_mean = None
         self._target_std = None
@@ -52,12 +54,6 @@ class BaseTrainer(object):
         self._allow_subsequent_nan_losses = cfg.allow_subsequent_nan_losses
         self._disable_pbar = cfg.verbose == 0
         self._max_updates_per_epoch = cfg.max_updates_per_epoch
-        self._early_stopping = cfg.early_stopping
-        self._patience_early_stopping = cfg.patience_early_stopping
-        self._minimum_epochs_before_early_stopping = cfg.minimum_epochs_before_early_stopping
-        self._dynamic_learning_rate = cfg.dynamic_learning_rate
-        self._patience_dynamic_learning_rate = cfg.patience_dynamic_learning_rate
-        self._factor_dynamic_learning_rate = cfg.factor_dynamic_learning_rate
 
         # load train basin list and add number of basins to the config
         self.basins = load_basin_file(cfg.train_basin_file)
@@ -91,6 +87,9 @@ class BaseTrainer(object):
 
     def _get_optimizer(self) -> torch.optim.Optimizer:
         return get_optimizer(model=self.model, cfg=self.cfg)
+
+    def _get_lr_scheduler(self) -> Optional[torch.optim.lr_scheduler.LRScheduler]:
+        return get_lr_scheduler(optimizer=self.optimizer, cfg=self.cfg)
 
     def _get_loss_obj(self) -> loss.BaseLoss:
         return get_loss_obj(cfg=self.cfg)
@@ -171,6 +170,7 @@ class BaseTrainer(object):
             self._freeze_model_parts()
 
         self.optimizer = self._get_optimizer()
+        self.lr_scheduler = self._get_lr_scheduler()
         self.loss_obj = self._get_loss_obj().to(self.device)
 
         # Add possible regularization terms to the loss function.
@@ -206,30 +206,42 @@ class BaseTrainer(object):
             self._target_std = torch.from_numpy(
                 ds.scaler["xarray_feature_scale"][self.cfg.target_variables].to_array().values).to(self.device)
 
+        # Initialize early stopping if configured
+        if self.cfg.early_stopping_patience is not None:
+            self.early_stopping = EarlyStopping(
+                patience=self.cfg.early_stopping_patience,
+                min_delta=self.cfg.early_stopping_min_delta,
+                mode=self.cfg.early_stopping_mode
+            )
+            self._best_model_path = None
+            LOGGER.info(f"Early stopping enabled: patience={self.cfg.early_stopping_patience}, "
+                       f"min_delta={self.cfg.early_stopping_min_delta}, "
+                       f"mode={self.cfg.early_stopping_mode}, "
+                       f"monitoring={self.cfg.early_stopping_metric}")
+
     def train_and_validate(self):
         """Train and validate the model.
 
         Train the model for the number of epochs specified in the run configuration, and perform validation after every
         ``validate_every`` epochs. Model and optimizer state are saved after every ``save_weights_every`` epochs.
         """
-        if self._early_stopping:
-            if self.cfg.is_continue_training:
-                LOGGER.warning("Early stopping state is reset.")   
-            early_stopper = EarlyStopper(patience = self._patience_early_stopping, min_delta = 0.0001)
-
-        if self._dynamic_learning_rate:
-            if self.cfg.is_continue_training:
-                LOGGER.warning("Scheduler state is reset.")
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=self._factor_dynamic_learning_rate, patience=self._patience_dynamic_learning_rate)
-
         for epoch in range(self._epoch + 1, self._epoch + self.cfg.epochs + 1):
-            if not self._dynamic_learning_rate:
-                if epoch in self.cfg.learning_rate.keys():
-                    LOGGER.info(f"Setting learning rate to {self.cfg.learning_rate[epoch]}")
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.cfg.learning_rate[epoch]
-
             self._train_epoch(epoch=epoch)
+            
+            # Step the learning rate scheduler if one is configured
+            if self.lr_scheduler is not None:
+                # For ReduceLROnPlateau, we need to pass the validation loss
+                if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    # We'll step this scheduler after validation, not here
+                    pass
+                else:
+                    self.lr_scheduler.step()
+                
+                # Log current learning rate to tensorboard/wandb
+                current_lr = self.optimizer.param_groups[0]['lr']
+                if self.experiment_logger is not None:
+                    self.experiment_logger.log_lr(current_lr)
+
             avg_losses = self.experiment_logger.summarise()
             loss_str = ", ".join(f"{k}: {v:.5f}" for k, v in avg_losses.items())
             LOGGER.info(f"Epoch {epoch} average loss: {loss_str}")
@@ -252,12 +264,36 @@ class BaseTrainer(object):
                     print_msg += ", ".join(f"{k}: {v:.5f}" for k, v in valid_metrics.items() if k != 'avg_total_loss')
                     LOGGER.info(print_msg)
                 
+                # Step ReduceLROnPlateau scheduler after validation
+                if (self.lr_scheduler is not None and 
+                    isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)):
+                    self.lr_scheduler.step(valid_metrics['avg_total_loss'])
+                    # Log current learning rate after plateau scheduler step
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    if self.experiment_logger is not None:
+                        self.experiment_logger.log_lr(current_lr)
 
-                if self._early_stopping and epoch > self._minimum_epochs_before_early_stopping and early_stopper.check_early_stopping(valid_metrics['avg_total_loss']):
-                    LOGGER.info(f"Early stopping triggered at epoch {epoch} with validation loss {valid_metrics['avg_total_loss']:.5f}. Training stopped.")
-                    break
-                if self._dynamic_learning_rate:
-                    scheduler.step(valid_metrics['avg_total_loss'])
+                # Check early stopping and save best model
+                if self.early_stopping is not None:
+                    metric_name = self.cfg.early_stopping_metric
+                    if metric_name not in valid_metrics:
+                        LOGGER.warning(f"Early stopping metric '{metric_name}' not found in validation metrics. "
+                                     f"Available metrics: {list(valid_metrics.keys())}. Using 'avg_total_loss'.")
+                        metric_name = 'avg_total_loss'
+                    
+                    metric_value = valid_metrics[metric_name]
+                    
+                    # Check if this is the best model so far
+                    is_best = self._is_best_model(metric_value)
+                    if is_best:
+                        self._save_best_model(epoch, metric_value)
+                    
+                    # Check if we should stop training
+                    if self.early_stopping(metric_value, epoch):
+                        LOGGER.info(f"Training stopped early at epoch {epoch}")
+                        if self._best_model_path:
+                            LOGGER.info(f"Best model saved at: {self._best_model_path}")
+                        break
 
         # make sure to close tensorboard to avoid losing the last epoch
         if self.cfg.log_tensorboard:
@@ -294,6 +330,31 @@ class BaseTrainer(object):
 
         optimizer_path = self.cfg.run_dir / f"optimizer_state_epoch{epoch:03d}.pt"
         torch.save(self.optimizer.state_dict(), str(optimizer_path))
+
+        self.experiment_logger.log_model(weight_path, optimizer_path)
+
+    def _is_best_model(self, metric_value: float) -> bool:
+        """Check if the current metric value represents the best model so far."""
+        if self.early_stopping is None:
+            return False
+        
+        if self.cfg.early_stopping_mode == 'min':
+            return metric_value < self.early_stopping.best_value
+        else:  # mode == 'max'
+            return metric_value > self.early_stopping.best_value
+
+    def _save_best_model(self, epoch: int, metric_value: float):
+        """Save the current model as the best model through wandb logger."""
+        best_model_path = self.cfg.run_dir / "best_model.pt"
+        torch.save(self.model.state_dict(), str(best_model_path))
+
+        # Log as artifact through wandb logger
+        if self.experiment_logger is not None:
+            self.experiment_logger.log_best_model(best_model_path, epoch)
+
+        self._best_model_path = best_model_path
+        LOGGER.info(f"New best model saved at epoch {epoch} with {self.cfg.early_stopping_metric}: "
+                   f"{metric_value:.5f}")
 
     def _train_epoch(self, epoch: int):
         self.model.train()
@@ -354,6 +415,7 @@ class BaseTrainer(object):
             pbar.set_postfix_str(f"Loss: {loss.item():.4f}")
 
             self.experiment_logger.log_step(**{k: v.item() for k, v in all_losses.items()})
+
     def _set_random_seeds(self):
         if self.cfg.seed is None:
             self.cfg.seed = int(np.random.uniform(low=0, high=1e6))

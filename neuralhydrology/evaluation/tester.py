@@ -126,10 +126,14 @@ class BaseTester(object):
             with open(file, "rb") as fp:
                 self.additional_features.append(pickle.load(fp))
 
-    def _get_weight_file(self, epoch: int):
+    def _get_weight_file(self, epoch):
         """Get file path to weight file"""
         if epoch is None:
             weight_file = sorted(list(self.run_dir.glob('model_epoch*.pt')))[-1]
+        
+        elif epoch == "best":
+            weight_file = sorted(list(self.run_dir.glob('best_model.pt')))[-1]
+
         else:
             weight_file = self.run_dir / f"model_epoch{str(epoch).zfill(3)}.pt"
 

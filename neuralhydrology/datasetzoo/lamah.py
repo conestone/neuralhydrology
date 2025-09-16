@@ -15,6 +15,8 @@ _SUBDATASET_TO_DIRECTORY = {
     'lamah_c': 'C_basins_intermediate_lowimp'
 }
 
+_VALID_TARGETS = ['qobs', 'qmean', 'qmin', 'qmax']  # Added list of valid target names
+
 
 class LamaH(BaseDataset):
     """Data set class for the LamaH-CE dataset by [#]_.
@@ -74,7 +76,7 @@ class LamaH(BaseDataset):
         # Discharge is provided in m3/s in the data set as 'Qobs [m3/s]'. We allow to use 'Qobs [mm/h]' or 'Qobs [mm/d]'
         # in the config and in this case will normalize on the fly. For that, we need the basin area
         self._all_variables = self._get_list_of_all_variables(cfg)
-        if any([f.startswith("qobs") for f in self._all_variables]):
+        if any([f.split('[')[0].strip().lower() in _VALID_TARGETS for f in self._all_variables]):
             df = load_lamah_attributes(cfg.data_dir, sub_dataset=cfg.dataset)
             self._basin_area = df["area_gov"]
 
@@ -99,7 +101,7 @@ class LamaH(BaseDataset):
             for val in cfg.dynamic_inputs.values():
                 all_variables = all_variables + val
         else:
-            all_variables = all_variables + cfg.dynamic_inputs_flattened
+            all_variables = all_variables + cfg.dynamic_inputs
         return all_variables
 
     def _load_basin_data(self, basin: str) -> pd.DataFrame:
@@ -108,22 +110,27 @@ class LamaH(BaseDataset):
         # Determine if hourly or daily data should be loaded, by default daily.
         temporal_resolution = '1D'
         if self.cfg.use_frequencies:
-            if any(utils.compare_frequencies(freq, '1D') == 1 for freq in self.cfg.use_frequencies):
-                temporal_resolution = '1h'
+            if any([utils.compare_frequencies(freq, '1D') == 1 for freq in self.cfg.use_frequencies]):
+                temporal_resolution = '1H'
 
         df = load_lamah_forcing(data_dir=self.cfg.data_dir,
                                 basin=basin,
                                 sub_dataset=self.cfg.dataset,
                                 temporal_resolution=temporal_resolution)
-        if any([f.startswith('qobs') for f in self._all_variables]):
-            # We normalize discharge here to make use of the cached basin areas.
+        
+        # Check if any of the valid targets are in the variables
+        targets_in_vars = [f.split('[')[0].strip().lower() for f in self._all_variables 
+                         if f.split('[')[0].strip().lower() in _VALID_TARGETS]
+        if targets_in_vars:
+            target_name = targets_in_vars[0]  # Use the first matching target
             discharge = load_lamah_discharge(data_dir=self.cfg.data_dir,
                                              basin=basin,
                                              temporal_resolution=temporal_resolution,
-                                             normalize_discharge=False)
-            df["qobs"] = _normalize_discharge(ser=discharge["qobs"],
-                                              area=self._basin_area.loc[basin],
-                                              temporal_resolution=temporal_resolution)
+                                             normalize_discharge=False,
+                                             target_name=target_name)
+            df[target_name] = _normalize_discharge(ser=discharge[target_name],
+                                                  area=self._basin_area.loc[basin],
+                                                  temporal_resolution=temporal_resolution)
 
         return df
 
@@ -145,7 +152,7 @@ def load_lamah_forcing(data_dir: Path, basin: str, sub_dataset: str, temporal_re
         One of {'lamah_a', 'lamah_b', 'lamah_c'}, defining which of the three catchment delinations/sub-datasets 
         (A_basins_total_upstrm, B_basins_intermediate_all, or C_basins_intermediate_lowimp) will be loaded.
     temporal_resolution: str, optional
-        Defines if either daily ('1D', default) or hourly ('1h') timeseries data will be loaded.
+        Defines if either daily ('1D', default) or hourly ('1H') timeseries data will be loaded.
 
     Returns
     -------
@@ -157,15 +164,15 @@ def load_lamah_forcing(data_dir: Path, basin: str, sub_dataset: str, temporal_re
     ValueError
         If 'sub_dataset' is not one of {'lamah_a', 'lamah_b', 'lamah_c'}.
     ValueError
-        If 'temporal_resolution' is not one of ['1h', '1D'].
+        If 'temporal_resolution' is not one of ['1H', '1D'].
     """
     if sub_dataset not in _SUBDATASET_TO_DIRECTORY:
         raise ValueError(
             f"{sub_dataset} is not a valid choice for 'sub_dataset'. Must be one of {_SUBDATASET_TO_DIRECTORY.keys()}.")
 
-    if temporal_resolution not in ['1D', '1h']:
+    if temporal_resolution not in ['1D', '1H']:
         raise ValueError(
-            f"{temporal_resolution} is not a valid choice for 'temporal_resolution'. Must be one of '1h', '1D'.")
+            f"{temporal_resolution} is not a valid choice for 'temporal_resolution'. Must be one of '1H', '1D'.")
 
     temporal_resolution_directory = 'daily' if temporal_resolution == '1D' else 'hourly'
 
@@ -177,7 +184,8 @@ def load_lamah_forcing(data_dir: Path, basin: str, sub_dataset: str, temporal_re
 def load_lamah_discharge(data_dir: Path,
                          basin: str,
                          temporal_resolution: str = '1D',
-                         normalize_discharge: bool = False) -> pd.DataFrame:
+                         normalize_discharge: bool = False,
+                         target_name: str = 'qobs') -> pd.DataFrame:
     """Load discharge data of the LamaH data set.
 
     Parameters
@@ -187,9 +195,11 @@ def load_lamah_discharge(data_dir: Path,
     basin : str
         Basin identifier number as string.
     temporal_resolution: str, optional
-        Defines if either daily ('1D', default) or hourly ('1h') timeseries data will be loaded.
+        Defines if either daily ('1D', default) or hourly ('1H') timeseries data will be loaded.
     normalize_discharge: bool, optional
         If true, normalizes discharge data by basin area, using the 'area_gov' attribute from attribute file.
+    target_name: str, optional
+        Name of the target variable to load (default: 'qobs'). Must be one of ['qobs', 'qmean', 'qmin', 'qmax'].
 
     Returns
     -------
@@ -199,24 +209,30 @@ def load_lamah_discharge(data_dir: Path,
     Raises
     ------
     ValueError
-        If 'temporal_resolution' is not one of ['1h', '1D'].
+        If 'temporal_resolution' is not one of ['1H', '1D'].
+    ValueError
+        If 'target_name' is not one of ['qobs', 'qmean', 'qmin', 'qmax'].
     """
-    if temporal_resolution not in ['1D', '1h']:
+    if temporal_resolution not in ['1D', '1H']:
         raise ValueError(
-            f"{temporal_resolution} is not a valid choice for 'temporal_resolution'. Must be one of '1h', '1D'.")
+            f"{temporal_resolution} is not a valid choice for 'temporal_resolution'. Must be one of '1H', '1D'.")
+            
+    if target_name not in _VALID_TARGETS:
+        raise ValueError(
+            f"{target_name} is not a valid choice for 'target_name'. Must be one of {_VALID_TARGETS}.")
 
     temporal_resolution_directory = 'daily' if temporal_resolution == '1D' else 'hourly'
     streamflow_dir = data_dir / 'D_gauges' / '2_timeseries' / temporal_resolution_directory
     df = _load_lamah_timeseries_csv_file(streamflow_dir / f"ID_{basin}.csv", temporal_resolution)
 
     # Replace missing discharge values (indicated by -999) to NaN
-    df.loc[df["qobs"] < 0, "qobs"] = np.nan
+    df.loc[df[target_name] < 0, target_name] = np.nan
 
     # If normalize_discharge is True, load attributes to extract upstream area.
     if normalize_discharge:
         attributes = load_lamah_attributes(data_dir, sub_dataset='lamah_a', basins=[basin])
         area = attributes.loc[basin, 'area_gov']
-        df["qobs"] = _normalize_discharge(df["qobs"], area, temporal_resolution)
+        df[target_name] = _normalize_discharge(df[target_name], area, temporal_resolution)
 
     return df
 
@@ -286,7 +302,7 @@ def _load_lamah_attribute_csv_file(file_path: Path) -> pd.DataFrame:
 
 def _normalize_discharge(ser: pd.Series, area: float, temporal_resolution: str) -> pd.Series:
     """Helper function to normalize discharge data by basin area"""
-    if temporal_resolution == "1h":
+    if temporal_resolution == "1H":
         return ser / (area * 1e6) * 1000 * 3600
     else:
         return ser / (area * 1e6) * 1000 * 86400

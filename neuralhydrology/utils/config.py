@@ -520,16 +520,37 @@ class Config(object):
         return self._as_default_dict(self._cfg.get("lagged_features", {}))
 
     @property
-    def learning_rate(self) -> Dict[int, float]:
+    def learning_rate(self) -> float:
+        """Initial learning rate for training.
+        
+        Returns
+        -------
+        float
+            The initial learning rate value.
+        """
         if ("learning_rate" in self._cfg.keys()) and (self._cfg["learning_rate"] is not None):
             if isinstance(self._cfg["learning_rate"], float):
-                return {0: self._cfg["learning_rate"]}
-            elif isinstance(self._cfg["learning_rate"], dict):
                 return self._cfg["learning_rate"]
+            elif isinstance(self._cfg["learning_rate"], dict):
+                # For backwards compatibility, if a dict is provided, use the first value
+                return list(self._cfg["learning_rate"].values())[0]
             else:
-                raise ValueError("Unsupported data type for learning rate. Use either dict (epoch to float) or float.")
+                raise ValueError("Unsupported data type for learning rate. Use float for initial learning rate.")
         else:
             raise ValueError("No learning rate specified in the config (.yml).")
+
+    @property
+    def lr_scheduler(self) -> dict:
+        """Learning rate scheduler configuration.
+        
+        Returns
+        -------
+        dict
+            Configuration dictionary for the learning rate scheduler. Contains 'type' key
+            specifying the scheduler type and additional parameters as keyword arguments.
+            Returns empty dict if no scheduler is configured.
+        """
+        return self._as_default_dict(self._cfg.get("lr_scheduler", {}))
 
     @property
     def log_interval(self) -> int:
@@ -915,53 +936,51 @@ class Config(object):
             Level of verbosity.
         """
         return self._cfg.get("verbose", 1)
-    
-    @property
-    def early_stopping(self) -> bool:
-        """Whether to use early stopping. Defaults to False if not set."""
-        early_stopping = self._cfg.get("early_stopping", False)
-        if early_stopping and self.validate_every != 1:
-            raise ValueError(
-                "Early stopping can only be used if validation is performed every epoch (validate_every=1). "
-                "Set validate_every=1 in the config to use early stopping."
-            )
-        return early_stopping
 
     @property
-    def patience_early_stopping(self) -> int:
-        """Number of epochs with no improvement before stopping."""
-        if self.early_stopping:
-            return self._get_value_verbose("patience_early_stopping")
+    def early_stopping_patience(self) -> int:
+        """Number of epochs to wait before stopping when no improvement is observed.
         
+        Returns
+        -------
+        int
+            Number of epochs to wait. Returns None if early stopping is disabled.
+        """
+        return self._cfg.get("early_stopping_patience", None)
+
     @property
-    def minimum_epochs_before_early_stopping(self) -> int:
-        """Minimum number of epochs before early stopping can be triggered."""
-        if self.early_stopping:
-            return self._get_value_verbose("minimum_epochs_before_early_stopping")
-    
-    @property
-    def dynamic_learning_rate(self) -> bool:
-        """Whether to use  dynamic learning rate. Defaults to False if not set."""
-        early_stopping = self._cfg.get("early_stopping", False)
-        if early_stopping and self.validate_every != 1:
-            raise ValueError(
-                "Early stopping can only be used if validation is performed every epoch (validate_every=1). "
-                "Set validate_every=1 in the config to use early stopping."
-            )
-        return early_stopping
-    
-    @property
-    def patience_dynamic_learning_rate(self) -> int:
-        """Number of epochs with no improvement before reducing learning rate."""
-        if self.dynamic_learning_rate:
-            return self._get_value_verbose("patience_dynamic_learning_rate")
+    def early_stopping_min_delta(self) -> float:
+        """Minimum change in validation loss to qualify as an improvement.
         
+        Returns
+        -------
+        float
+            Minimum delta for measuring improvement.
+        """
+        return self._cfg.get("early_stopping_min_delta", 0.0)
+
     @property
-    def factor_dynamic_learning_rate(self) -> float:
-        """Factor by which to reduce learning rate."""
-        if self.dynamic_learning_rate:
-            return self._get_value_verbose("factor_dynamic_learning_rate")
-    
+    def early_stopping_metric(self) -> str:
+        """Metric to monitor for early stopping.
+        
+        Returns
+        -------
+        str
+            Name of the metric to monitor. Defaults to 'avg_total_loss'.
+        """
+        return self._cfg.get("early_stopping_metric", "avg_total_loss")
+
+    @property
+    def early_stopping_mode(self) -> str:
+        """Whether to minimize or maximize the early stopping metric.
+        
+        Returns
+        -------
+        str
+            'min' to minimize the metric, 'max' to maximize it. Defaults to 'min'.
+        """
+        return self._cfg.get("early_stopping_mode", "min")
+
     def _get_embedding_spec(self, embedding_spec: dict) -> dict:
         if isinstance(embedding_spec, bool) and embedding_spec:  #
             msg = [
